@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Meshify",
     "author": "OpenAI",
-    "version": (0, 0, 39),
+    "version": (0, 0, 40),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Meshify",
-    "description": "Meshify UI Fix + Evaluation",
+    "description": "Meshify Adaptive Strategy Switching",
     "category": "3D View",
 }
 
@@ -17,8 +17,8 @@ import bmesh
 # =========================================================
 meshify_clusters_ngon = []
 meshify_clusters_nm = []
-
 meshify_last_result = None
+meshify_last_message = ""
 
 
 # =========================================================
@@ -102,25 +102,20 @@ def cluster_faces(faces):
 
 
 # =========================================================
-# CLASSIFICATION
+# CLASSIFICATION (unchanged simplified)
 # =========================================================
 def classify_nm_cluster(bm, cluster):
     size = len(cluster)
 
-    # simple hole assumption (same as your current logic)
     if size <= 4:
-        complexity = "SMALL"
         confidence = "HIGH"
     elif size <= 10:
-        complexity = "MEDIUM"
         confidence = "MEDIUM"
     else:
-        complexity = "LARGE"
         confidence = "LOW"
 
     return {
         "type": "Hole",
-        "complexity": complexity,
         "confidence": confidence,
         "size": size,
         "indices": cluster
@@ -128,7 +123,7 @@ def classify_nm_cluster(bm, cluster):
 
 
 # =========================================================
-# EXECUTION (UNCHANGED)
+# EXECUTION WITH ADAPTIVE STRATEGY
 # =========================================================
 class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
     bl_idname = "meshify.fix_nm_cluster"
@@ -138,7 +133,7 @@ class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
     cluster_index: bpy.props.IntProperty()
 
     def execute(self, context):
-        global meshify_last_result
+        global meshify_last_result, meshify_last_message
 
         obj = context.active_object
         bm = bmesh.from_edit_mesh(obj.data)
@@ -149,26 +144,67 @@ class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
 
         cluster = meshify_clusters_nm[self.cluster_index]["indices"]
 
+        # -------------------------
+        # PRIMARY: MERGE + FILL
+        # -------------------------
         bm.edges.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
 
-        edges = [
-            bm.edges[i]
-            for i in cluster
-            if i < len(bm.edges) and bm.edges[i].is_valid
-        ]
+        verts = set()
+        for i in cluster:
+            if i < len(bm.edges) and bm.edges[i].is_valid:
+                for v in bm.edges[i].verts:
+                    verts.add(v)
+
+        if verts:
+            bmesh.ops.remove_doubles(bm, verts=list(verts), dist=0.0001)
+
+        edges = [bm.edges[i] for i in cluster if i < len(bm.edges) and bm.edges[i].is_valid]
 
         if edges:
             bmesh.ops.holes_fill(bm, edges=edges)
 
         bmesh.update_edit_mesh(obj.data)
 
+        # -------------------------
+        # EVALUATE PRIMARY
+        # -------------------------
         bm = bmesh.from_edit_mesh(obj.data)
         after_nm, after_ng = count_issues(bm)
 
         if (after_nm + after_ng) < (before_nm + before_ng):
             meshify_last_result = "SUCCESS"
+            meshify_last_message = "✔ Primary fix worked"
+            return {'FINISHED'}
+
+        # -------------------------
+        # FALLBACK: FILL ONLY
+        # -------------------------
+        meshify_last_message = "⚠ Primary failed → using fallback"
+
+        bpy.ops.ed.undo_push(message="Meshify Fallback")
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.edges.ensure_lookup_table()
+
+        edges = [bm.edges[i] for i in cluster if i < len(bm.edges) and bm.edges[i].is_valid]
+
+        if edges:
+            bmesh.ops.holes_fill(bm, edges=edges)
+
+        bmesh.update_edit_mesh(obj.data)
+
+        # -------------------------
+        # EVALUATE FALLBACK
+        # -------------------------
+        bm = bmesh.from_edit_mesh(obj.data)
+        final_nm, final_ng = count_issues(bm)
+
+        if (final_nm + final_ng) < (before_nm + before_ng):
+            meshify_last_result = "SUCCESS"
         else:
             meshify_last_result = "WARNING"
+            meshify_last_message = "⚠ Fallback failed → unresolved"
 
         return {'FINISHED'}
 
@@ -181,7 +217,7 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
     cluster_index: bpy.props.IntProperty()
 
     def execute(self, context):
-        global meshify_last_result
+        global meshify_last_result, meshify_last_message
 
         obj = context.active_object
         bm = bmesh.from_edit_mesh(obj.data)
@@ -190,30 +226,47 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
 
         bpy.ops.ed.undo_push(message="Meshify Fix")
 
+        # PRIMARY: TRIANGULATE
         bm.faces.ensure_lookup_table()
 
         cluster = meshify_clusters_ngon[self.cluster_index]
 
-        faces = [
-            bm.faces[i]
-            for i in cluster
-            if i < len(bm.faces)
-            and bm.faces[i].is_valid
-            and len(bm.faces[i].verts) > 4
-        ]
+        faces = [bm.faces[i] for i in cluster if i < len(bm.faces) and bm.faces[i].is_valid]
 
         if faces:
             bmesh.ops.triangulate(bm, faces=faces)
 
         bmesh.update_edit_mesh(obj.data)
 
+        # EVALUATE
         bm = bmesh.from_edit_mesh(obj.data)
         after_nm, after_ng = count_issues(bm)
 
         if (after_nm + after_ng) < (before_nm + before_ng):
             meshify_last_result = "SUCCESS"
+            meshify_last_message = "✔ Primary fix worked"
+            return {'FINISHED'}
+
+        # FALLBACK: TRIANGULATE + MERGE
+        meshify_last_message = "⚠ Primary failed → using fallback"
+
+        bpy.ops.ed.undo_push(message="Meshify Fallback")
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+
+        bmesh.update_edit_mesh(obj.data)
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        final_nm, final_ng = count_issues(bm)
+
+        if (final_nm + final_ng) < (before_nm + before_ng):
+            meshify_last_result = "SUCCESS"
         else:
             meshify_last_result = "WARNING"
+            meshify_last_message = "⚠ Fallback failed → unresolved"
 
         return {'FINISHED'}
 
@@ -228,7 +281,7 @@ class MESHIFY_OT_undo_last(bpy.types.Operator):
 
 
 # =========================================================
-# 🔥 DETECTION PIPELINE (CRITICAL FIX)
+# DETECTION PIPELINE
 # =========================================================
 def run_detection(context):
     global meshify_clusters_ngon, meshify_clusters_nm
@@ -249,7 +302,7 @@ def run_detection(context):
 
 
 # =========================================================
-# UI (FIXED)
+# UI
 # =========================================================
 class MESHIFY_PT_main(bpy.types.Panel):
     bl_label = "Meshify"
@@ -266,44 +319,32 @@ class MESHIFY_PT_main(bpy.types.Panel):
         if not context.scene.meshify_enabled:
             return
 
-        # ALWAYS RUN DETECTION
         run_detection(context)
 
-        # Undo button
-        layout.operator("meshify.undo_last", text="Undo Last Fix")
+        layout.operator("meshify.undo_last")
 
-        # ✅ Evaluation (ADDITIVE, NOT REPLACING)
-        if meshify_last_result == "SUCCESS":
-            layout.label(text="✔ Fix improved mesh")
-        elif meshify_last_result == "WARNING":
-            layout.label(text="⚠ Fix did not improve mesh")
+        # MESSAGE
+        if meshify_last_message:
+            layout.label(text=meshify_last_message)
 
         layout.separator()
 
-        # ✅ RESTORED PROBLEM DISPLAY
+        # NM
         if meshify_clusters_nm:
-            layout.label(text="Non-Manifold Clusters:")
+            layout.label(text="Non-Manifold:")
             for i, c in enumerate(meshify_clusters_nm):
                 row = layout.row()
-
-                row.label(
-                    text=f"{c['type']} ({c['size']} edges) [{c['confidence']}]"
-                )
-
+                row.label(text=f"Hole ({c['size']} edges) [{c['confidence']}]")
                 op = row.operator("meshify.fix_nm_cluster", text="Fix")
                 op.cluster_index = i
 
+        # NGON
         if meshify_clusters_ngon:
             layout.separator()
-            layout.label(text="Ngon Clusters:")
-
+            layout.label(text="Ngons:")
             for i, cluster in enumerate(meshify_clusters_ngon):
                 row = layout.row()
-
-                row.label(
-                    text=f"Ngon ({len(cluster)} faces) [MEDIUM]"
-                )
-
+                row.label(text=f"Ngon ({len(cluster)} faces) [MEDIUM]")
                 op = row.operator("meshify.fix_ngon_cluster", text="Fix")
                 op.cluster_index = i
 
