@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Meshify",
     "author": "OpenAI",
-    "version": (0, 0, 29),
+    "version": (0, 0, 31),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Meshify",
-    "description": "Meshify Cluster Priority System",
+    "description": "Meshify Adaptive Fix Chains",
     "category": "3D View",
 }
 
@@ -16,13 +16,12 @@ import bmesh
 # STATE
 # =========================================================
 _draw_handle = None
-
-meshify_clusters_ngon = []   # list of dicts {indices, priority, label}
+meshify_clusters_ngon = []
 meshify_clusters_nm = []
 
 
 # =========================================================
-# DETECTION (UNCHANGED)
+# DETECTION
 # =========================================================
 def detect_ngons(bm):
     return [f for f in bm.faces if len(f.verts) > 4]
@@ -33,7 +32,7 @@ def detect_non_manifold(bm):
 
 
 # =========================================================
-# CLUSTERING (UNCHANGED LOGIC)
+# CLUSTERING (UNCHANGED)
 # =========================================================
 def cluster_faces(faces):
     visited = set()
@@ -96,54 +95,9 @@ def cluster_edges(edges):
 
 
 # =========================================================
-# PRIORITY ENGINE (NEW)
+# EXECUTION (ADAPTIVE FIX CHAINS)
 # =========================================================
-def compute_priority(cluster_size, issue_type):
-    # Issue type weight
-    if issue_type == "NON_MANIFOLD":
-        base = 3
-    elif issue_type == "NGON":
-        base = 2
-    else:
-        base = 1
 
-    # Size factor (simple scaling)
-    score = base * 100 + cluster_size
-
-    # Label mapping
-    if base == 3:
-        label = "HIGH"
-    elif base == 2:
-        label = "MEDIUM"
-    else:
-        label = "LOW"
-
-    return score, label
-
-
-def build_priority_clusters(raw_clusters, issue_type):
-    result = []
-
-    for cluster in raw_clusters:
-        size = len(cluster)
-        score, label = compute_priority(size, issue_type)
-
-        result.append({
-            "indices": cluster,
-            "size": size,
-            "score": score,
-            "label": label,
-        })
-
-    # sort descending
-    result.sort(key=lambda c: c["score"], reverse=True)
-
-    return result
-
-
-# =========================================================
-# EXECUTION (UNCHANGED)
-# =========================================================
 class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
     bl_idname = "meshify.fix_ngon_cluster"
     bl_label = "Fix Ngon Cluster"
@@ -151,10 +105,11 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
     cluster_index: bpy.props.IntProperty()
 
     def execute(self, context):
+        # Only 1 step: triangulate
         bm = bmesh.from_edit_mesh(context.active_object.data)
         bm.faces.ensure_lookup_table()
 
-        cluster = meshify_clusters_ngon[self.cluster_index]["indices"]
+        cluster = meshify_clusters_ngon[self.cluster_index]
 
         faces = [
             bm.faces[i]
@@ -178,22 +133,45 @@ class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
     cluster_index: bpy.props.IntProperty()
 
     def execute(self, context):
+        cluster = meshify_clusters_nm[self.cluster_index]
+        cluster_size = len(cluster)
+
+        # -------------------------
+        # STEP 1: MERGE (ALWAYS)
+        # -------------------------
         bm = bmesh.from_edit_mesh(context.active_object.data)
         bm.edges.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
 
-        cluster = meshify_clusters_nm[self.cluster_index]["indices"]
+        verts = set()
+        for i in cluster:
+            if i < len(bm.edges) and bm.edges[i].is_valid:
+                for v in bm.edges[i].verts:
+                    verts.add(v)
 
-        edges = [
-            bm.edges[i]
-            for i in cluster
-            if i < len(bm.edges)
-            and bm.edges[i].is_valid
-        ]
-
-        if edges:
-            bmesh.ops.holes_fill(bm, edges=edges)
+        if verts:
+            bmesh.ops.remove_doubles(bm, verts=list(verts), dist=0.0001)
 
         bmesh.update_edit_mesh(context.active_object.data)
+
+        # -------------------------
+        # STEP 2: FILL (ONLY IF BIG)
+        # -------------------------
+        if cluster_size > 2:
+            bm = bmesh.from_edit_mesh(context.active_object.data)
+            bm.edges.ensure_lookup_table()
+
+            edges = [
+                bm.edges[i]
+                for i in cluster
+                if i < len(bm.edges) and bm.edges[i].is_valid
+            ]
+
+            if edges:
+                bmesh.ops.holes_fill(bm, edges=edges)
+
+            bmesh.update_edit_mesh(context.active_object.data)
+
         return {'FINISHED'}
 
 
@@ -217,11 +195,8 @@ def draw_meshify():
     ngons = detect_ngons(bm)
     nm_edges = detect_non_manifold(bm)
 
-    raw_ngon = cluster_faces(ngons)
-    raw_nm = cluster_edges(nm_edges)
-
-    meshify_clusters_ngon = build_priority_clusters(raw_ngon, "NGON")
-    meshify_clusters_nm = build_priority_clusters(raw_nm, "NON_MANIFOLD")
+    meshify_clusters_ngon = cluster_faces(ngons)
+    meshify_clusters_nm = cluster_edges(nm_edges)
 
 
 # =========================================================
@@ -250,7 +225,7 @@ def update_meshify_enabled(self, context):
 
 
 # =========================================================
-# UI
+# UI (ADAPTIVE STEP COUNT)
 # =========================================================
 class MESHIFY_PT_main(bpy.types.Panel):
     bl_label = "Meshify"
@@ -270,20 +245,26 @@ class MESHIFY_PT_main(bpy.types.Panel):
         # NGON
         if meshify_clusters_ngon:
             layout.label(text="Ngon Clusters:")
-            for i, c in enumerate(meshify_clusters_ngon):
+            for i, cluster in enumerate(meshify_clusters_ngon):
                 row = layout.row()
-                row.label(text=f"[{c['label']}] ({c['size']} faces)")
-                op = row.operator("meshify.fix_ngon_cluster", text="Fix")
+                row.label(text=f"Cluster {i} ({len(cluster)} faces)")
+                op = row.operator("meshify.fix_ngon_cluster", text="Fix (1 step)")
                 op.cluster_index = i
 
-        # NON MANIFOLD
+        # NON-MANIFOLD
         if meshify_clusters_nm:
             layout.separator()
             layout.label(text="Non-Manifold Clusters:")
-            for i, c in enumerate(meshify_clusters_nm):
+
+            for i, cluster in enumerate(meshify_clusters_nm):
+                steps = 1 if len(cluster) <= 2 else 2
+
                 row = layout.row()
-                row.label(text=f"[{c['label']}] ({c['size']} edges)")
-                op = row.operator("meshify.fix_nm_cluster", text="Fix")
+                row.label(text=f"Cluster {i} ({len(cluster)} edges)")
+                op = row.operator(
+                    "meshify.fix_nm_cluster",
+                    text=f"Fix ({steps} step{'s' if steps > 1 else ''})"
+                )
                 op.cluster_index = i
 
 
