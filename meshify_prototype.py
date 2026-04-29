@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Meshify",
     "author": "OpenAI",
-    "version": (0, 0, 35),
+    "version": (0, 0, 37),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Meshify",
-    "description": "Meshify Risk-Aware Execution",
+    "description": "Meshify Undo Fix + Detection Restore",
     "category": "3D View",
 }
 
@@ -16,15 +16,15 @@ import time
 # =========================================================
 # STATE
 # =========================================================
-_draw_handle = None
 meshify_clusters_ngon = []
 meshify_clusters_nm = []
 
-# confirmation state
 meshify_confirm_state = {
     "cluster_id": None,
     "timestamp": 0
 }
+
+meshify_last_fix = False
 
 
 # =========================================================
@@ -102,7 +102,7 @@ def cluster_faces(faces):
 
 
 # =========================================================
-# CLASSIFICATION + CONFIDENCE
+# CLASSIFICATION
 # =========================================================
 def classify_hole_complexity(size):
     if size <= 4:
@@ -162,11 +162,10 @@ def classify_nm_cluster(bm, cluster):
 
 
 # =========================================================
-# RISK-AWARE EXECUTION
+# CONFIRMATION
 # =========================================================
 def require_confirmation(cluster_id):
     global meshify_confirm_state
-
     now = time.time()
 
     if meshify_confirm_state["cluster_id"] == cluster_id:
@@ -179,23 +178,29 @@ def require_confirmation(cluster_id):
     return False
 
 
+# =========================================================
+# EXECUTION (UNCHANGED)
+# =========================================================
 class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
     bl_idname = "meshify.fix_nm_cluster"
     bl_label = "Fix Non-Manifold Cluster"
+    bl_options = {'REGISTER', 'UNDO'}
 
     cluster_index: bpy.props.IntProperty()
 
     def execute(self, context):
+        global meshify_last_fix
+
         cluster_data = meshify_clusters_nm[self.cluster_index]
         confidence = cluster_data.get("confidence", "LOW")
 
-        # LOW confidence → require confirmation
         if confidence == "LOW":
             if not require_confirmation(self.cluster_index):
                 self.report({'WARNING'}, "⚠ Click again to confirm")
                 return {'CANCELLED'}
 
-        # actual execution
+        bpy.ops.ed.undo_push(message="Meshify Fix")
+
         bm = bmesh.from_edit_mesh(context.active_object.data)
         bm.edges.ensure_lookup_table()
 
@@ -211,17 +216,22 @@ class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
             bmesh.ops.holes_fill(bm, edges=edges)
 
         bmesh.update_edit_mesh(context.active_object.data)
+
+        meshify_last_fix = True
         return {'FINISHED'}
 
 
 class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
     bl_idname = "meshify.fix_ngon_cluster"
     bl_label = "Fix Ngon Cluster"
+    bl_options = {'REGISTER', 'UNDO'}
 
     cluster_index: bpy.props.IntProperty()
 
     def execute(self, context):
-        # NGONS → MEDIUM → no confirmation needed
+        global meshify_last_fix
+
+        bpy.ops.ed.undo_push(message="Meshify Fix")
 
         bm = bmesh.from_edit_mesh(context.active_object.data)
         bm.faces.ensure_lookup_table()
@@ -240,19 +250,32 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
             bmesh.ops.triangulate(bm, faces=faces)
 
         bmesh.update_edit_mesh(context.active_object.data)
+
+        meshify_last_fix = True
+        return {'FINISHED'}
+
+
+class MESHIFY_OT_undo_last(bpy.types.Operator):
+    bl_idname = "meshify.undo_last"
+    bl_label = "Undo Last Fix"
+
+    def execute(self, context):
+        global meshify_last_fix
+
+        if meshify_last_fix:
+            bpy.ops.ed.undo()
+            meshify_last_fix = False
+
         return {'FINISHED'}
 
 
 # =========================================================
-# CORE
+# 🔥 FIX: DETECTION PIPELINE RUNS HERE
 # =========================================================
-def draw_meshify():
+def run_detection(context):
     global meshify_clusters_ngon, meshify_clusters_nm
 
-    if not bpy.context.scene.meshify_enabled:
-        return
-
-    obj = bpy.context.active_object
+    obj = context.active_object
     if not obj or obj.mode != 'EDIT':
         meshify_clusters_ngon = []
         meshify_clusters_nm = []
@@ -264,37 +287,7 @@ def draw_meshify():
     nm_edges = detect_non_manifold(bm)
 
     meshify_clusters_ngon = cluster_faces(ngons)
-
-    raw_nm = cluster_edges(nm_edges)
-
-    meshify_clusters_nm = [
-        classify_nm_cluster(bm, c) for c in raw_nm
-    ]
-
-
-# =========================================================
-# HANDLER
-# =========================================================
-def add_draw_handler():
-    global _draw_handle
-    if _draw_handle is None:
-        _draw_handle = bpy.types.SpaceView3D.draw_handler_add(
-            draw_meshify, (), 'WINDOW', 'POST_VIEW'
-        )
-
-
-def remove_draw_handler():
-    global _draw_handle
-    if _draw_handle:
-        bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
-        _draw_handle = None
-
-
-def update_meshify_enabled(self, context):
-    if self.meshify_enabled:
-        add_draw_handler()
-    else:
-        remove_draw_handler()
+    meshify_clusters_nm = [classify_nm_cluster(bm, c) for c in cluster_edges(nm_edges)]
 
 
 # =========================================================
@@ -315,34 +308,26 @@ class MESHIFY_PT_main(bpy.types.Panel):
         if not context.scene.meshify_enabled:
             return
 
-        # NON-MANIFOLD
+        # 🔥 CRITICAL FIX: run detection EVERY DRAW
+        run_detection(context)
+
+        layout.operator("meshify.undo_last", text="Undo Last Fix")
+
         if meshify_clusters_nm:
             layout.label(text="Non-Manifold Clusters:")
-
             for i, c in enumerate(meshify_clusters_nm):
-                cluster = c["indices"]
                 confidence = c.get("confidence", "LOW")
-
-                # confirmation UI state
-                warning = ""
-                if meshify_confirm_state["cluster_id"] == i:
-                    warning = " ⚠ Click again to confirm"
-
                 row = layout.row()
-                row.label(text=f"Hole ({len(cluster)} edges) [{confidence}]{warning}")
-
+                row.label(text=f"Hole [{confidence}]")
                 op = row.operator("meshify.fix_nm_cluster", text="Fix")
                 op.cluster_index = i
 
-        # NGON
         if meshify_clusters_ngon:
             layout.separator()
             layout.label(text="Ngon Clusters:")
-
             for i, cluster in enumerate(meshify_clusters_ngon):
                 row = layout.row()
-                row.label(text=f"Ngon ({len(cluster)} faces) [MEDIUM]")
-
+                row.label(text="Ngon [MEDIUM]")
                 op = row.operator("meshify.fix_ngon_cluster", text="Fix")
                 op.cluster_index = i
 
@@ -354,13 +339,13 @@ classes = (
     MESHIFY_PT_main,
     MESHIFY_OT_fix_nm_cluster,
     MESHIFY_OT_fix_ngon_cluster,
+    MESHIFY_OT_undo_last,
 )
 
 def register():
     bpy.types.Scene.meshify_enabled = bpy.props.BoolProperty(
         name="Enable Meshify",
         default=False,
-        update=update_meshify_enabled,
     )
 
     for c in classes:
@@ -368,8 +353,6 @@ def register():
 
 
 def unregister():
-    remove_draw_handler()
-
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
 
