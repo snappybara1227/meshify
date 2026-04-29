@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Meshify",
     "author": "OpenAI",
-    "version": (0, 0, 37),
+    "version": (0, 0, 38),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Meshify",
     "category": "3D View",
@@ -18,13 +18,14 @@ meshify_ngon_clusters = []
 meshify_last_message = ""
 meshify_last_operation = ""
 meshify_last_result = ""
+meshify_selected_strategy = ""  # 🔥 NEW
 
 meshify_memory = {
     "non_manifold": "fill",
     "ngon": "triangulate"
 }
 
-meshify_memory_updated = "No"  # 🔥 NEW
+meshify_memory_updated = "No"
 
 # =========================================================
 # DETECTION
@@ -116,7 +117,7 @@ def run_detection(context):
     meshify_ngon_clusters = cluster_faces(detect_ngons(bm))
 
 # =========================================================
-# EXECUTION WITH EVALUATION + CONTROLLED MEMORY
+# EXECUTION WITH STRATEGY SELECTION
 # =========================================================
 class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
     bl_idname = "meshify.fix_nm_cluster"
@@ -128,9 +129,14 @@ class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
     def execute(self, context):
         global meshify_last_message, meshify_last_operation
         global meshify_last_result, meshify_memory, meshify_memory_updated
+        global meshify_selected_strategy
 
         if self.cluster_index >= len(meshify_nm_clusters):
             return {'CANCELLED'}
+
+        # SELECT STRATEGY
+        strategy = meshify_memory.get("non_manifold", "fill")
+        meshify_selected_strategy = strategy
 
         # BEFORE
         run_detection(context)
@@ -144,8 +150,14 @@ class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
         bm.edges.ensure_lookup_table()
         edges = [bm.edges[i] for i in cluster if i < len(bm.edges)]
 
-        if edges:
-            bmesh.ops.holes_fill(bm, edges=edges)
+        if strategy == "fill":
+            if edges:
+                bmesh.ops.holes_fill(bm, edges=edges)
+
+        elif strategy == "merge":
+            if edges:
+                verts = set(v for e in edges for v in e.verts)
+                bmesh.ops.remove_doubles(bm, verts=list(verts), dist=0.0001)
 
         bmesh.update_edit_mesh(obj.data)
 
@@ -158,14 +170,14 @@ class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
         if improvement:
             meshify_last_message = "✔ Fix improved mesh"
             meshify_last_result = "improved"
-            meshify_memory["non_manifold"] = "fill"  # ✅ ONLY HERE
+            meshify_memory["non_manifold"] = strategy
             meshify_memory_updated = "Yes"
         else:
             meshify_last_message = "⚠ No improvement"
             meshify_last_result = "no improvement"
             meshify_memory_updated = "No"
 
-        meshify_last_operation = "fill"
+        meshify_last_operation = strategy
 
         return {'FINISHED'}
 
@@ -180,9 +192,14 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
     def execute(self, context):
         global meshify_last_message, meshify_last_operation
         global meshify_last_result, meshify_memory, meshify_memory_updated
+        global meshify_selected_strategy
 
         if self.cluster_index >= len(meshify_ngon_clusters):
             return {'CANCELLED'}
+
+        # SELECT STRATEGY
+        strategy = meshify_memory.get("ngon", "triangulate")
+        meshify_selected_strategy = strategy
 
         # BEFORE
         run_detection(context)
@@ -196,8 +213,9 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
         bm.faces.ensure_lookup_table()
         faces = [bm.faces[i] for i in cluster if i < len(bm.faces)]
 
-        if faces:
-            bmesh.ops.triangulate(bm, faces=faces)
+        if strategy == "triangulate":
+            if faces:
+                bmesh.ops.triangulate(bm, faces=faces)
 
         bmesh.update_edit_mesh(obj.data)
 
@@ -210,14 +228,14 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
         if improvement:
             meshify_last_message = "✔ Fix improved mesh"
             meshify_last_result = "improved"
-            meshify_memory["ngon"] = "triangulate"  # ✅ ONLY HERE
+            meshify_memory["ngon"] = strategy
             meshify_memory_updated = "Yes"
         else:
             meshify_last_message = "⚠ No improvement"
             meshify_last_result = "no improvement"
             meshify_memory_updated = "No"
 
-        meshify_last_operation = "triangulate"
+        meshify_last_operation = strategy
 
         return {'FINISHED'}
 
@@ -284,11 +302,12 @@ class MESHIFY_PT_main(bpy.types.Panel):
         # DEV PANEL
         layout.separator()
         layout.label(text="--- DEV ---")
+        layout.label(text=f"Selected strategy: {meshify_selected_strategy}")
         layout.label(text=f"NM clusters: {len(meshify_nm_clusters)}")
         layout.label(text=f"Ngon clusters: {len(meshify_ngon_clusters)}")
         layout.label(text=f"Last operation: {meshify_last_operation}")
         layout.label(text=f"Last result: {meshify_last_result}")
-        layout.label(text=f"Memory updated: {meshify_memory_updated}")  # 🔥 NEW
+        layout.label(text=f"Memory updated: {meshify_memory_updated}")
         layout.label(text=f"Memory NM: {meshify_memory['non_manifold']}")
         layout.label(text=f"Memory Ngon: {meshify_memory['ngon']}")
 
