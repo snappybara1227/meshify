@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Meshify",
     "author": "OpenAI",
-    "version": (0, 0, 38),
+    "version": (0, 0, 39),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Meshify",
     "category": "3D View",
@@ -18,14 +18,35 @@ meshify_ngon_clusters = []
 meshify_last_message = ""
 meshify_last_operation = ""
 meshify_last_result = ""
-meshify_selected_strategy = ""  # 🔥 NEW
+meshify_selected_strategy = ""
+meshify_selected_context = ""  # 🔥 NEW
 
+# 🔥 CONTEXT-AWARE MEMORY
 meshify_memory = {
-    "non_manifold": "fill",
-    "ngon": "triangulate"
+    "non_manifold": {
+        "small": "fill",
+        "medium": "fill",
+        "large": "fill"
+    },
+    "ngon": {
+        "small": "triangulate",
+        "medium": "triangulate",
+        "large": "triangulate"
+    }
 }
 
 meshify_memory_updated = "No"
+
+# =========================================================
+# CONTEXT FUNCTION
+# =========================================================
+def get_context(size):
+    if size <= 4:
+        return "small"
+    elif size <= 8:
+        return "medium"
+    else:
+        return "large"
 
 # =========================================================
 # DETECTION
@@ -117,7 +138,7 @@ def run_detection(context):
     meshify_ngon_clusters = cluster_faces(detect_ngons(bm))
 
 # =========================================================
-# EXECUTION WITH STRATEGY SELECTION
+# EXECUTION WITH CONTEXT-AWARE STRATEGY
 # =========================================================
 class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
     bl_idname = "meshify.fix_nm_cluster"
@@ -129,13 +150,17 @@ class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
     def execute(self, context):
         global meshify_last_message, meshify_last_operation
         global meshify_last_result, meshify_memory, meshify_memory_updated
-        global meshify_selected_strategy
+        global meshify_selected_strategy, meshify_selected_context
 
         if self.cluster_index >= len(meshify_nm_clusters):
             return {'CANCELLED'}
 
-        # SELECT STRATEGY
-        strategy = meshify_memory.get("non_manifold", "fill")
+        cluster = meshify_nm_clusters[self.cluster_index]
+        context_type = get_context(len(cluster))
+        meshify_selected_context = context_type
+
+        # SAFE ACCESS (avoid KeyError)
+        strategy = meshify_memory.get("non_manifold", {}).get(context_type, "fill")
         meshify_selected_strategy = strategy
 
         # BEFORE
@@ -145,9 +170,7 @@ class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
         obj = context.active_object
         bm = bmesh.from_edit_mesh(obj.data)
 
-        cluster = meshify_nm_clusters[self.cluster_index]
-
-        bm.edges.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()  # needed when indexing :contentReference[oaicite:0]{index=0}
         edges = [bm.edges[i] for i in cluster if i < len(bm.edges)]
 
         if strategy == "fill":
@@ -170,7 +193,7 @@ class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
         if improvement:
             meshify_last_message = "✔ Fix improved mesh"
             meshify_last_result = "improved"
-            meshify_memory["non_manifold"] = strategy
+            meshify_memory.setdefault("non_manifold", {})[context_type] = strategy
             meshify_memory_updated = "Yes"
         else:
             meshify_last_message = "⚠ No improvement"
@@ -192,13 +215,16 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
     def execute(self, context):
         global meshify_last_message, meshify_last_operation
         global meshify_last_result, meshify_memory, meshify_memory_updated
-        global meshify_selected_strategy
+        global meshify_selected_strategy, meshify_selected_context
 
         if self.cluster_index >= len(meshify_ngon_clusters):
             return {'CANCELLED'}
 
-        # SELECT STRATEGY
-        strategy = meshify_memory.get("ngon", "triangulate")
+        cluster = meshify_ngon_clusters[self.cluster_index]
+        context_type = get_context(len(cluster))
+        meshify_selected_context = context_type
+
+        strategy = meshify_memory.get("ngon", {}).get(context_type, "triangulate")
         meshify_selected_strategy = strategy
 
         # BEFORE
@@ -208,9 +234,7 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
         obj = context.active_object
         bm = bmesh.from_edit_mesh(obj.data)
 
-        cluster = meshify_ngon_clusters[self.cluster_index]
-
-        bm.faces.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()  # required before index access :contentReference[oaicite:1]{index=1}
         faces = [bm.faces[i] for i in cluster if i < len(bm.faces)]
 
         if strategy == "triangulate":
@@ -228,7 +252,7 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
         if improvement:
             meshify_last_message = "✔ Fix improved mesh"
             meshify_last_result = "improved"
-            meshify_memory["ngon"] = strategy
+            meshify_memory.setdefault("ngon", {})[context_type] = strategy
             meshify_memory_updated = "Yes"
         else:
             meshify_last_message = "⚠ No improvement"
@@ -302,6 +326,7 @@ class MESHIFY_PT_main(bpy.types.Panel):
         # DEV PANEL
         layout.separator()
         layout.label(text="--- DEV ---")
+        layout.label(text=f"Context: {meshify_selected_context}")
         layout.label(text=f"Selected strategy: {meshify_selected_strategy}")
         layout.label(text=f"NM clusters: {len(meshify_nm_clusters)}")
         layout.label(text=f"Ngon clusters: {len(meshify_ngon_clusters)}")
