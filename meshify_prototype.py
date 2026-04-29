@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Meshify",
     "author": "OpenAI",
-    "version": (0, 0, 33),
+    "version": (0, 0, 37),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Meshify",
     "category": "3D View",
@@ -17,11 +17,14 @@ meshify_nm_clusters = []
 meshify_ngon_clusters = []
 meshify_last_message = ""
 meshify_last_operation = ""
+meshify_last_result = ""
 
 meshify_memory = {
     "non_manifold": "fill",
     "ngon": "triangulate"
 }
+
+meshify_memory_updated = "No"  # 🔥 NEW
 
 # =========================================================
 # DETECTION
@@ -113,7 +116,7 @@ def run_detection(context):
     meshify_ngon_clusters = cluster_faces(detect_ngons(bm))
 
 # =========================================================
-# EXECUTION (SAFE LAYER ADDED)
+# EXECUTION WITH EVALUATION + CONTROLLED MEMORY
 # =========================================================
 class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
     bl_idname = "meshify.fix_nm_cluster"
@@ -123,11 +126,15 @@ class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
     cluster_index: bpy.props.IntProperty()
 
     def execute(self, context):
-        global meshify_last_message, meshify_last_operation, meshify_memory
+        global meshify_last_message, meshify_last_operation
+        global meshify_last_result, meshify_memory, meshify_memory_updated
 
-        # ✅ INDEX SAFETY
         if self.cluster_index >= len(meshify_nm_clusters):
             return {'CANCELLED'}
+
+        # BEFORE
+        run_detection(context)
+        nm_before = len(meshify_nm_clusters)
 
         obj = context.active_object
         bm = bmesh.from_edit_mesh(obj.data)
@@ -142,12 +149,23 @@ class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
 
         bmesh.update_edit_mesh(obj.data)
 
-        # ✅ REFRESH DETECTION
+        # AFTER
         run_detection(context)
+        nm_after = len(meshify_nm_clusters)
 
-        meshify_last_message = "✔ Fix applied"
+        improvement = nm_after < nm_before
+
+        if improvement:
+            meshify_last_message = "✔ Fix improved mesh"
+            meshify_last_result = "improved"
+            meshify_memory["non_manifold"] = "fill"  # ✅ ONLY HERE
+            meshify_memory_updated = "Yes"
+        else:
+            meshify_last_message = "⚠ No improvement"
+            meshify_last_result = "no improvement"
+            meshify_memory_updated = "No"
+
         meshify_last_operation = "fill"
-        meshify_memory["non_manifold"] = "fill"
 
         return {'FINISHED'}
 
@@ -160,11 +178,15 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
     cluster_index: bpy.props.IntProperty()
 
     def execute(self, context):
-        global meshify_last_message, meshify_last_operation, meshify_memory
+        global meshify_last_message, meshify_last_operation
+        global meshify_last_result, meshify_memory, meshify_memory_updated
 
-        # ✅ INDEX SAFETY
         if self.cluster_index >= len(meshify_ngon_clusters):
             return {'CANCELLED'}
+
+        # BEFORE
+        run_detection(context)
+        ngon_before = len(meshify_ngon_clusters)
 
         obj = context.active_object
         bm = bmesh.from_edit_mesh(obj.data)
@@ -179,12 +201,23 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
 
         bmesh.update_edit_mesh(obj.data)
 
-        # ✅ REFRESH DETECTION
+        # AFTER
         run_detection(context)
+        ngon_after = len(meshify_ngon_clusters)
 
-        meshify_last_message = "✔ Fix applied"
+        improvement = ngon_after < ngon_before
+
+        if improvement:
+            meshify_last_message = "✔ Fix improved mesh"
+            meshify_last_result = "improved"
+            meshify_memory["ngon"] = "triangulate"  # ✅ ONLY HERE
+            meshify_memory_updated = "Yes"
+        else:
+            meshify_last_message = "⚠ No improvement"
+            meshify_last_result = "no improvement"
+            meshify_memory_updated = "No"
+
         meshify_last_operation = "triangulate"
-        meshify_memory["ngon"] = "triangulate"
 
         return {'FINISHED'}
 
@@ -195,12 +228,14 @@ class MESHIFY_OT_undo(bpy.types.Operator):
 
     def execute(self, context):
         global meshify_last_operation, meshify_last_message
+        global meshify_last_result, meshify_memory_updated
 
         bpy.ops.ed.undo()
 
-        # ✅ UNDO STATE FIX
         meshify_last_operation = "undo"
         meshify_last_message = "↩ Undo"
+        meshify_last_result = ""
+        meshify_memory_updated = "No"
 
         return {'FINISHED'}
 
@@ -231,7 +266,6 @@ class MESHIFY_PT_main(bpy.types.Panel):
 
         layout.separator()
 
-        # NM
         layout.label(text="Non-Manifold:")
         for i, cluster in enumerate(meshify_nm_clusters):
             row = layout.row()
@@ -239,7 +273,6 @@ class MESHIFY_PT_main(bpy.types.Panel):
             op = row.operator("meshify.fix_nm_cluster", text="Fix")
             op.cluster_index = i
 
-        # NGON
         layout.separator()
         layout.label(text="Ngons:")
         for i, cluster in enumerate(meshify_ngon_clusters):
@@ -248,12 +281,14 @@ class MESHIFY_PT_main(bpy.types.Panel):
             op = row.operator("meshify.fix_ngon_cluster", text="Fix")
             op.cluster_index = i
 
-        # DEV
+        # DEV PANEL
         layout.separator()
         layout.label(text="--- DEV ---")
         layout.label(text=f"NM clusters: {len(meshify_nm_clusters)}")
         layout.label(text=f"Ngon clusters: {len(meshify_ngon_clusters)}")
         layout.label(text=f"Last operation: {meshify_last_operation}")
+        layout.label(text=f"Last result: {meshify_last_result}")
+        layout.label(text=f"Memory updated: {meshify_memory_updated}")  # 🔥 NEW
         layout.label(text=f"Memory NM: {meshify_memory['non_manifold']}")
         layout.label(text=f"Memory Ngon: {meshify_memory['ngon']}")
 
