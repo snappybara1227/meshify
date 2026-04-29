@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Meshify",
     "author": "OpenAI",
-    "version": (0, 0, 31),
+    "version": (0, 0, 33),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Meshify",
-    "description": "Meshify Adaptive Fix Chains",
+    "description": "Meshify Hole Complexity Classification",
     "category": "3D View",
 }
 
@@ -21,7 +21,7 @@ meshify_clusters_nm = []
 
 
 # =========================================================
-# DETECTION
+# DETECTION (UNCHANGED)
 # =========================================================
 def detect_ngons(bm):
     return [f for f in bm.faces if len(f.verts) > 4]
@@ -34,36 +34,6 @@ def detect_non_manifold(bm):
 # =========================================================
 # CLUSTERING (UNCHANGED)
 # =========================================================
-def cluster_faces(faces):
-    visited = set()
-    clusters = []
-    face_set = set(f.index for f in faces)
-
-    for f in faces:
-        if f.index in visited:
-            continue
-
-        stack = [f]
-        cluster = []
-
-        while stack:
-            cur = stack.pop()
-            if cur.index in visited:
-                continue
-
-            visited.add(cur.index)
-            cluster.append(cur.index)
-
-            for e in cur.edges:
-                for nf in e.link_faces:
-                    if nf.index in face_set and nf.index not in visited:
-                        stack.append(nf)
-
-        clusters.append(cluster)
-
-    return clusters
-
-
 def cluster_edges(edges):
     visited = set()
     clusters = []
@@ -94,9 +64,113 @@ def cluster_edges(edges):
     return clusters
 
 
+def cluster_faces(faces):
+    visited = set()
+    clusters = []
+    face_set = set(f.index for f in faces)
+
+    for f in faces:
+        if f.index in visited:
+            continue
+
+        stack = [f]
+        cluster = []
+
+        while stack:
+            cur = stack.pop()
+            if cur.index in visited:
+                continue
+
+            visited.add(cur.index)
+            cluster.append(cur.index)
+
+            for e in cur.edges:
+                for nf in e.link_faces:
+                    if nf.index in face_set and nf.index not in visited:
+                        stack.append(nf)
+
+        clusters.append(cluster)
+
+    return clusters
+
+
 # =========================================================
-# EXECUTION (ADAPTIVE FIX CHAINS)
+# HOLE COMPLEXITY CLASSIFICATION (NEW)
 # =========================================================
+def classify_hole_complexity(cluster_size):
+    if cluster_size <= 4:
+        return "SMALL"
+    elif cluster_size <= 10:
+        return "MEDIUM"
+    else:
+        return "LARGE"
+
+
+def classify_nm_cluster(bm, cluster):
+    boundary_edges = []
+
+    for i in cluster:
+        if i >= len(bm.edges):
+            continue
+
+        e = bm.edges[i]
+        if not e.is_valid:
+            continue
+
+        if e.is_boundary:
+            boundary_edges.append(i)
+
+    # If all edges are boundary → treat as hole
+    if len(boundary_edges) == len(cluster):
+        size = len(boundary_edges)
+        complexity = classify_hole_complexity(size)
+
+        return {
+            "type": "HOLE",
+            "complexity": complexity,
+            "size": size
+        }
+
+    return {
+        "type": "OTHER",
+        "complexity": None,
+        "size": len(cluster)
+    }
+
+
+# =========================================================
+# EXECUTION (UPDATED LOGIC)
+# =========================================================
+class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
+    bl_idname = "meshify.fix_nm_cluster"
+    bl_label = "Fix Non-Manifold Cluster"
+
+    cluster_index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        cluster_data = meshify_clusters_nm[self.cluster_index]
+        cluster = cluster_data["indices"]
+        ctype = cluster_data["type"]
+        complexity = cluster_data.get("complexity")
+
+        # HOLE LOGIC ONLY (refined)
+        if ctype == "HOLE":
+            bm = bmesh.from_edit_mesh(context.active_object.data)
+            bm.edges.ensure_lookup_table()
+
+            edges = [
+                bm.edges[i]
+                for i in cluster
+                if i < len(bm.edges) and bm.edges[i].is_valid
+            ]
+
+            if edges:
+                bmesh.ops.holes_fill(bm, edges=edges)
+
+            bmesh.update_edit_mesh(context.active_object.data)
+
+        return {'FINISHED'}
+
 
 class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
     bl_idname = "meshify.fix_ngon_cluster"
@@ -105,7 +179,6 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
     cluster_index: bpy.props.IntProperty()
 
     def execute(self, context):
-        # Only 1 step: triangulate
         bm = bmesh.from_edit_mesh(context.active_object.data)
         bm.faces.ensure_lookup_table()
 
@@ -123,55 +196,6 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
             bmesh.ops.triangulate(bm, faces=faces)
 
         bmesh.update_edit_mesh(context.active_object.data)
-        return {'FINISHED'}
-
-
-class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
-    bl_idname = "meshify.fix_nm_cluster"
-    bl_label = "Fix Non-Manifold Cluster"
-
-    cluster_index: bpy.props.IntProperty()
-
-    def execute(self, context):
-        cluster = meshify_clusters_nm[self.cluster_index]
-        cluster_size = len(cluster)
-
-        # -------------------------
-        # STEP 1: MERGE (ALWAYS)
-        # -------------------------
-        bm = bmesh.from_edit_mesh(context.active_object.data)
-        bm.edges.ensure_lookup_table()
-        bm.verts.ensure_lookup_table()
-
-        verts = set()
-        for i in cluster:
-            if i < len(bm.edges) and bm.edges[i].is_valid:
-                for v in bm.edges[i].verts:
-                    verts.add(v)
-
-        if verts:
-            bmesh.ops.remove_doubles(bm, verts=list(verts), dist=0.0001)
-
-        bmesh.update_edit_mesh(context.active_object.data)
-
-        # -------------------------
-        # STEP 2: FILL (ONLY IF BIG)
-        # -------------------------
-        if cluster_size > 2:
-            bm = bmesh.from_edit_mesh(context.active_object.data)
-            bm.edges.ensure_lookup_table()
-
-            edges = [
-                bm.edges[i]
-                for i in cluster
-                if i < len(bm.edges) and bm.edges[i].is_valid
-            ]
-
-            if edges:
-                bmesh.ops.holes_fill(bm, edges=edges)
-
-            bmesh.update_edit_mesh(context.active_object.data)
-
         return {'FINISHED'}
 
 
@@ -196,7 +220,16 @@ def draw_meshify():
     nm_edges = detect_non_manifold(bm)
 
     meshify_clusters_ngon = cluster_faces(ngons)
-    meshify_clusters_nm = cluster_edges(nm_edges)
+
+    raw_nm = cluster_edges(nm_edges)
+
+    typed = []
+    for cluster in raw_nm:
+        data = classify_nm_cluster(bm, cluster)
+        data["indices"] = cluster
+        typed.append(data)
+
+    meshify_clusters_nm = typed
 
 
 # =========================================================
@@ -225,7 +258,7 @@ def update_meshify_enabled(self, context):
 
 
 # =========================================================
-# UI (ADAPTIVE STEP COUNT)
+# UI (UPDATED LABELS)
 # =========================================================
 class MESHIFY_PT_main(bpy.types.Panel):
     bl_label = "Meshify"
@@ -242,30 +275,34 @@ class MESHIFY_PT_main(bpy.types.Panel):
         if not context.scene.meshify_enabled:
             return
 
-        # NGON
-        if meshify_clusters_ngon:
-            layout.label(text="Ngon Clusters:")
-            for i, cluster in enumerate(meshify_clusters_ngon):
-                row = layout.row()
-                row.label(text=f"Cluster {i} ({len(cluster)} faces)")
-                op = row.operator("meshify.fix_ngon_cluster", text="Fix (1 step)")
-                op.cluster_index = i
-
-        # NON-MANIFOLD
         if meshify_clusters_nm:
-            layout.separator()
             layout.label(text="Non-Manifold Clusters:")
 
-            for i, cluster in enumerate(meshify_clusters_nm):
-                steps = 1 if len(cluster) <= 2 else 2
+            for i, c in enumerate(meshify_clusters_nm):
+                cluster = c["indices"]
+                ctype = c["type"]
 
-                row = layout.row()
-                row.label(text=f"Cluster {i} ({len(cluster)} edges)")
-                op = row.operator(
-                    "meshify.fix_nm_cluster",
-                    text=f"Fix ({steps} step{'s' if steps > 1 else ''})"
-                )
-                op.cluster_index = i
+                if ctype == "HOLE":
+                    comp = c["complexity"]
+
+                    if comp == "SMALL":
+                        label = "Small Hole"
+                        warning = ""
+                    elif comp == "MEDIUM":
+                        label = "Medium Hole"
+                        warning = ""
+                    else:
+                        label = "Large Hole"
+                        warning = " ⚠"
+
+                    row = layout.row()
+                    row.label(text=f"{label} ({len(cluster)} edges){warning}")
+
+                    op = row.operator(
+                        "meshify.fix_nm_cluster",
+                        text="Fix (1 step)"
+                    )
+                    op.cluster_index = i
 
 
 # =========================================================
@@ -273,8 +310,8 @@ class MESHIFY_PT_main(bpy.types.Panel):
 # =========================================================
 classes = (
     MESHIFY_PT_main,
-    MESHIFY_OT_fix_ngon_cluster,
     MESHIFY_OT_fix_nm_cluster,
+    MESHIFY_OT_fix_ngon_cluster,
 )
 
 def register():
