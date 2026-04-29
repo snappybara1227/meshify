@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Meshify",
     "author": "OpenAI",
-    "version": (0, 0, 17),
+    "version": (0, 0, 20),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Meshify",
-    "description": "Meshify refactored architecture (single-file)",
+    "description": "Meshify with Execution Engine (Non-manifold fix)",
     "category": "3D View",
 }
 
@@ -15,7 +15,7 @@ from gpu_extras.batch import batch_for_shader
 
 
 # =========================================================
-# 1. STATE LAYER (GLOBAL STATE + PROPERTIES)
+# 1. STATE LAYER
 # =========================================================
 _draw_handle = None
 meshify_suggestions = set()
@@ -36,7 +36,7 @@ def unregister_props():
 
 
 # =========================================================
-# 2. DETECTION ENGINE (PURE ANALYSIS)
+# 2. DETECTION ENGINE
 # =========================================================
 def detect_non_manifold(bm):
     return [e for e in bm.edges if not e.is_manifold]
@@ -66,7 +66,7 @@ def detect_distortion(bm):
 
 
 # =========================================================
-# 3. SUGGESTION ENGINE (RULE MAPPING)
+# 3. SUGGESTION ENGINE
 # =========================================================
 def build_suggestions(nm, ngons, valence, distortion):
     suggestions = set()
@@ -84,7 +84,72 @@ def build_suggestions(nm, ngons, valence, distortion):
 
 
 # =========================================================
-# 4. DRAW ENGINE (GPU VISUALIZATION)
+# 4. SAFETY ENGINE
+# =========================================================
+def classify_suggestion(s):
+    if "Non-manifold" in s:
+        if "Fill hole" in s:
+            return "SAFE"
+        return "CAUTION"
+    if "Ngon" in s:
+        return "CAUTION"
+    if "Bad valence" in s:
+        return "RISK"
+    if "Distortion" in s:
+        return "CAUTION"
+    return "SAFE"
+
+
+# =========================================================
+# 5. RANKING ENGINE
+# =========================================================
+def rank_suggestions(suggestions):
+    def priority(s):
+        if "Non-manifold" in s:
+            return 0
+        if "Ngon" in s:
+            return 1
+        if "Bad valence" in s:
+            return 2
+        if "Distortion" in s:
+            return 3
+        return 99
+
+    return sorted(suggestions, key=priority)
+
+
+# =========================================================
+# 6. EXECUTION ENGINE (NEW)
+# =========================================================
+class MESHIFY_OT_fix_non_manifold(bpy.types.Operator):
+    bl_idname = "meshify.fix_non_manifold"
+    bl_label = "Apply Fix (Fill Holes)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+
+        if obj is None or obj.type != 'MESH' or obj.mode != 'EDIT':
+            return {'CANCELLED'}
+
+        bm = bmesh.from_edit_mesh(obj.data)
+
+        # Find boundary edges (holes)
+        boundary_edges = [e for e in bm.edges if e.is_boundary]
+
+        if not boundary_edges:
+            self.report({'INFO'}, "No holes to fill")
+            return {'CANCELLED'}
+
+        # Fill holes safely
+        bmesh.ops.holes_fill(bm, edges=boundary_edges)
+
+        bmesh.update_edit_mesh(obj.data)
+        return {'FINISHED'}
+
+
+# =========================================================
+# 7. DRAW ENGINE
 # =========================================================
 def draw_meshify():
     global meshify_suggestions
@@ -101,46 +166,18 @@ def draw_meshify():
 
     world = obj.matrix_world
 
-    # --- Detection ---
     nm_edges = detect_non_manifold(bm)
     ngon_faces = detect_ngons(bm)
     valence_verts = detect_bad_valence(bm)
     distortion_faces = detect_distortion(bm)
 
-    # --- Suggestions ---
     meshify_suggestions = build_suggestions(
         nm_edges, ngon_faces, valence_verts, distortion_faces
     )
 
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
 
-    # --- DRAW: DISTORTION (BLUE) ---
-    tris = []
-    for f in distortion_faces:
-        verts = [world @ v.co for v in f.verts]
-        for i in range(1, len(verts) - 1):
-            tris.extend([verts[0], verts[i], verts[i + 1]])
-
-    if tris:
-        batch = batch_for_shader(shader, 'TRIS', {"pos": tris})
-        shader.bind()
-        shader.uniform_float("color", (0.2, 0.6, 1.0, 0.3))
-        batch.draw(shader)
-
-    # --- DRAW: NGON (ORANGE) ---
-    tris = []
-    for f in ngon_faces:
-        verts = [world @ v.co for v in f.verts]
-        for i in range(1, len(verts) - 1):
-            tris.extend([verts[0], verts[i], verts[i + 1]])
-
-    if tris:
-        batch = batch_for_shader(shader, 'TRIS', {"pos": tris})
-        shader.bind()
-        shader.uniform_float("color", (1.0, 0.5, 0.1, 0.35))
-        batch.draw(shader)
-
-    # --- DRAW: NON-MANIFOLD (RED EDGES) ---
+    # Non-manifold
     lines = []
     for e in nm_edges:
         v1 = world @ e.verts[0].co
@@ -152,26 +189,6 @@ def draw_meshify():
         shader.bind()
         shader.uniform_float("color", (1.0, 0.0, 0.0, 1.0))
         gpu.state.line_width_set(4.0)
-        batch.draw(shader)
-
-    # --- DRAW: VALENCE (YELLOW MARKERS) ---
-    lines = []
-    for v in valence_verts:
-        co = world @ v.co
-        scale = max(obj.dimensions) * 0.02 if max(obj.dimensions) > 0 else 0.05
-
-        lines.extend([
-            (co.x - scale, co.y, co.z),
-            (co.x + scale, co.y, co.z),
-            (co.x, co.y - scale, co.z),
-            (co.x, co.y + scale, co.z),
-        ])
-
-    if lines:
-        batch = batch_for_shader(shader, 'LINES', {"pos": lines})
-        shader.bind()
-        shader.uniform_float("color", (1.0, 1.0, 0.2, 1.0))
-        gpu.state.line_width_set(2.0)
         batch.draw(shader)
 
     gpu.state.line_width_set(1.0)
@@ -197,7 +214,7 @@ def remove_draw_handler():
 
     try:
         bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
-    except Exception:
+    except:
         pass
 
     _draw_handle = None
@@ -209,14 +226,9 @@ def update_meshify_enabled(self, context):
     else:
         remove_draw_handler()
 
-    if context and context.window and context.window.screen:
-        for area in context.window.screen.areas:
-            if area.type == 'VIEW_3D':
-                area.tag_redraw()
-
 
 # =========================================================
-# 5. UI LAYER
+# 8. UI LAYER
 # =========================================================
 class MESHIFY_PT_main(bpy.types.Panel):
     bl_label = "Meshify"
@@ -229,15 +241,29 @@ class MESHIFY_PT_main(bpy.types.Panel):
         layout = self.layout
 
         layout.prop(context.scene, "meshify_enabled")
-
         layout.separator()
+
         layout.label(text="Suggestions:")
 
         if not meshify_suggestions:
             layout.label(text="No issues detected")
         else:
-            for s in sorted(meshify_suggestions):
-                layout.label(text=f"- {s}")
+            ranked = rank_suggestions(meshify_suggestions)
+
+            for i, s in enumerate(ranked, 1):
+                safety = classify_suggestion(s)
+                layout.label(text=f"{i}. [{safety}] {s}")
+
+            layout.separator()
+
+            # EXECUTION BUTTON (SAFE ONLY)
+            for s in ranked:
+                if classify_suggestion(s) == "SAFE" and "Non-manifold" in s:
+                    layout.operator(
+                        "meshify.fix_non_manifold",
+                        text="Apply Fix (Fill Hole)"
+                    )
+                    break
 
 
 # =========================================================
@@ -245,6 +271,7 @@ class MESHIFY_PT_main(bpy.types.Panel):
 # =========================================================
 classes = (
     MESHIFY_PT_main,
+    MESHIFY_OT_fix_non_manifold,
 )
 
 
