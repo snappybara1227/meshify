@@ -1,15 +1,16 @@
 bl_info = {
     "name": "Meshify",
     "author": "OpenAI",
-    "version": (0, 0, 33),
+    "version": (0, 0, 35),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Meshify",
-    "description": "Meshify Hole Complexity Classification",
+    "description": "Meshify Risk-Aware Execution",
     "category": "3D View",
 }
 
 import bpy
 import bmesh
+import time
 
 
 # =========================================================
@@ -19,9 +20,15 @@ _draw_handle = None
 meshify_clusters_ngon = []
 meshify_clusters_nm = []
 
+# confirmation state
+meshify_confirm_state = {
+    "cluster_id": None,
+    "timestamp": 0
+}
+
 
 # =========================================================
-# DETECTION (UNCHANGED)
+# DETECTION
 # =========================================================
 def detect_ngons(bm):
     return [f for f in bm.faces if len(f.verts) > 4]
@@ -32,7 +39,7 @@ def detect_non_manifold(bm):
 
 
 # =========================================================
-# CLUSTERING (UNCHANGED)
+# CLUSTERING
 # =========================================================
 def cluster_edges(edges):
     visited = set()
@@ -95,15 +102,30 @@ def cluster_faces(faces):
 
 
 # =========================================================
-# HOLE COMPLEXITY CLASSIFICATION (NEW)
+# CLASSIFICATION + CONFIDENCE
 # =========================================================
-def classify_hole_complexity(cluster_size):
-    if cluster_size <= 4:
+def classify_hole_complexity(size):
+    if size <= 4:
         return "SMALL"
-    elif cluster_size <= 10:
+    elif size <= 10:
         return "MEDIUM"
     else:
         return "LARGE"
+
+
+def assign_confidence(cluster_type, complexity=None):
+    if cluster_type == "HOLE":
+        if complexity == "SMALL":
+            return "HIGH"
+        elif complexity == "MEDIUM":
+            return "MEDIUM"
+        else:
+            return "LOW"
+
+    if cluster_type == "NGON":
+        return "MEDIUM"
+
+    return "LOW"
 
 
 def classify_nm_cluster(bm, cluster):
@@ -120,27 +142,43 @@ def classify_nm_cluster(bm, cluster):
         if e.is_boundary:
             boundary_edges.append(i)
 
-    # If all edges are boundary → treat as hole
     if len(boundary_edges) == len(cluster):
         size = len(boundary_edges)
         complexity = classify_hole_complexity(size)
+        confidence = assign_confidence("HOLE", complexity)
 
         return {
             "type": "HOLE",
             "complexity": complexity,
-            "size": size
+            "confidence": confidence,
+            "indices": cluster
         }
 
     return {
         "type": "OTHER",
-        "complexity": None,
-        "size": len(cluster)
+        "confidence": "LOW",
+        "indices": cluster
     }
 
 
 # =========================================================
-# EXECUTION (UPDATED LOGIC)
+# RISK-AWARE EXECUTION
 # =========================================================
+def require_confirmation(cluster_id):
+    global meshify_confirm_state
+
+    now = time.time()
+
+    if meshify_confirm_state["cluster_id"] == cluster_id:
+        if now - meshify_confirm_state["timestamp"] < 2:
+            meshify_confirm_state["cluster_id"] = None
+            return True
+
+    meshify_confirm_state["cluster_id"] = cluster_id
+    meshify_confirm_state["timestamp"] = now
+    return False
+
+
 class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
     bl_idname = "meshify.fix_nm_cluster"
     bl_label = "Fix Non-Manifold Cluster"
@@ -149,26 +187,30 @@ class MESHIFY_OT_fix_nm_cluster(bpy.types.Operator):
 
     def execute(self, context):
         cluster_data = meshify_clusters_nm[self.cluster_index]
+        confidence = cluster_data.get("confidence", "LOW")
+
+        # LOW confidence → require confirmation
+        if confidence == "LOW":
+            if not require_confirmation(self.cluster_index):
+                self.report({'WARNING'}, "⚠ Click again to confirm")
+                return {'CANCELLED'}
+
+        # actual execution
+        bm = bmesh.from_edit_mesh(context.active_object.data)
+        bm.edges.ensure_lookup_table()
+
         cluster = cluster_data["indices"]
-        ctype = cluster_data["type"]
-        complexity = cluster_data.get("complexity")
 
-        # HOLE LOGIC ONLY (refined)
-        if ctype == "HOLE":
-            bm = bmesh.from_edit_mesh(context.active_object.data)
-            bm.edges.ensure_lookup_table()
+        edges = [
+            bm.edges[i]
+            for i in cluster
+            if i < len(bm.edges) and bm.edges[i].is_valid
+        ]
 
-            edges = [
-                bm.edges[i]
-                for i in cluster
-                if i < len(bm.edges) and bm.edges[i].is_valid
-            ]
+        if edges:
+            bmesh.ops.holes_fill(bm, edges=edges)
 
-            if edges:
-                bmesh.ops.holes_fill(bm, edges=edges)
-
-            bmesh.update_edit_mesh(context.active_object.data)
-
+        bmesh.update_edit_mesh(context.active_object.data)
         return {'FINISHED'}
 
 
@@ -179,6 +221,8 @@ class MESHIFY_OT_fix_ngon_cluster(bpy.types.Operator):
     cluster_index: bpy.props.IntProperty()
 
     def execute(self, context):
+        # NGONS → MEDIUM → no confirmation needed
+
         bm = bmesh.from_edit_mesh(context.active_object.data)
         bm.faces.ensure_lookup_table()
 
@@ -223,13 +267,9 @@ def draw_meshify():
 
     raw_nm = cluster_edges(nm_edges)
 
-    typed = []
-    for cluster in raw_nm:
-        data = classify_nm_cluster(bm, cluster)
-        data["indices"] = cluster
-        typed.append(data)
-
-    meshify_clusters_nm = typed
+    meshify_clusters_nm = [
+        classify_nm_cluster(bm, c) for c in raw_nm
+    ]
 
 
 # =========================================================
@@ -258,7 +298,7 @@ def update_meshify_enabled(self, context):
 
 
 # =========================================================
-# UI (UPDATED LABELS)
+# UI
 # =========================================================
 class MESHIFY_PT_main(bpy.types.Panel):
     bl_label = "Meshify"
@@ -275,34 +315,36 @@ class MESHIFY_PT_main(bpy.types.Panel):
         if not context.scene.meshify_enabled:
             return
 
+        # NON-MANIFOLD
         if meshify_clusters_nm:
             layout.label(text="Non-Manifold Clusters:")
 
             for i, c in enumerate(meshify_clusters_nm):
                 cluster = c["indices"]
-                ctype = c["type"]
+                confidence = c.get("confidence", "LOW")
 
-                if ctype == "HOLE":
-                    comp = c["complexity"]
+                # confirmation UI state
+                warning = ""
+                if meshify_confirm_state["cluster_id"] == i:
+                    warning = " ⚠ Click again to confirm"
 
-                    if comp == "SMALL":
-                        label = "Small Hole"
-                        warning = ""
-                    elif comp == "MEDIUM":
-                        label = "Medium Hole"
-                        warning = ""
-                    else:
-                        label = "Large Hole"
-                        warning = " ⚠"
+                row = layout.row()
+                row.label(text=f"Hole ({len(cluster)} edges) [{confidence}]{warning}")
 
-                    row = layout.row()
-                    row.label(text=f"{label} ({len(cluster)} edges){warning}")
+                op = row.operator("meshify.fix_nm_cluster", text="Fix")
+                op.cluster_index = i
 
-                    op = row.operator(
-                        "meshify.fix_nm_cluster",
-                        text="Fix (1 step)"
-                    )
-                    op.cluster_index = i
+        # NGON
+        if meshify_clusters_ngon:
+            layout.separator()
+            layout.label(text="Ngon Clusters:")
+
+            for i, cluster in enumerate(meshify_clusters_ngon):
+                row = layout.row()
+                row.label(text=f"Ngon ({len(cluster)} faces) [MEDIUM]")
+
+                op = row.operator("meshify.fix_ngon_cluster", text="Fix")
+                op.cluster_index = i
 
 
 # =========================================================
