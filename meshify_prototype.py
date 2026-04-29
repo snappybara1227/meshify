@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Meshify",
     "author": "OpenAI",
-    "version": (0, 0, 16),
+    "version": (0, 0, 17),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Meshify",
-    "description": "Meshify with multi-layer visualization + suggestions",
+    "description": "Meshify refactored architecture (single-file)",
     "category": "3D View",
 }
 
@@ -14,17 +14,78 @@ import bmesh
 from gpu_extras.batch import batch_for_shader
 
 
-# ---------------------------
-# GLOBAL STATE
-# ---------------------------
+# =========================================================
+# 1. STATE LAYER (GLOBAL STATE + PROPERTIES)
+# =========================================================
 _draw_handle = None
 meshify_suggestions = set()
 DISTORTION_RATIO_THRESHOLD = 1.5
 
 
-# ---------------------------
-# DRAW CALLBACK
-# ---------------------------
+def register_props():
+    bpy.types.Scene.meshify_enabled = bpy.props.BoolProperty(
+        name="Enable Meshify",
+        default=False,
+        update=update_meshify_enabled,
+    )
+
+
+def unregister_props():
+    if hasattr(bpy.types.Scene, "meshify_enabled"):
+        del bpy.types.Scene.meshify_enabled
+
+
+# =========================================================
+# 2. DETECTION ENGINE (PURE ANALYSIS)
+# =========================================================
+def detect_non_manifold(bm):
+    return [e for e in bm.edges if not e.is_manifold]
+
+
+def detect_ngons(bm):
+    return [f for f in bm.faces if len(f.verts) > 4]
+
+
+def detect_bad_valence(bm):
+    return [v for v in bm.verts if len(v.link_edges) != 4]
+
+
+def detect_distortion(bm):
+    bad_faces = []
+    for f in bm.faces:
+        lengths = [e.calc_length() for e in f.edges]
+        if not lengths:
+            continue
+        max_len = max(lengths)
+        min_len = min(lengths)
+        if min_len == 0:
+            continue
+        if (max_len / min_len) > DISTORTION_RATIO_THRESHOLD:
+            bad_faces.append(f)
+    return bad_faces
+
+
+# =========================================================
+# 3. SUGGESTION ENGINE (RULE MAPPING)
+# =========================================================
+def build_suggestions(nm, ngons, valence, distortion):
+    suggestions = set()
+
+    if nm:
+        suggestions.add("Non-manifold → Merge by distance / Fill hole")
+    if ngons:
+        suggestions.add("Ngon → Triangulate or subdivide")
+    if valence:
+        suggestions.add("Bad valence → Adjust edge flow")
+    if distortion:
+        suggestions.add("Distortion → Even edge spacing")
+
+    return suggestions
+
+
+# =========================================================
+# 4. DRAW ENGINE (GPU VISUALIZATION)
+# =========================================================
 def draw_meshify():
     global meshify_suggestions
 
@@ -40,107 +101,74 @@ def draw_meshify():
 
     world = obj.matrix_world
 
-    # reset suggestions every frame
-    meshify_suggestions = set()
+    # --- Detection ---
+    nm_edges = detect_non_manifold(bm)
+    ngon_faces = detect_ngons(bm)
+    valence_verts = detect_bad_valence(bm)
+    distortion_faces = detect_distortion(bm)
 
-    # ---------------------------
-    # NON-MANIFOLD EDGES
-    # ---------------------------
-    nm_lines = []
-    for e in bm.edges:
-        if not e.is_manifold:
-            v1 = world @ e.verts[0].co
-            v2 = world @ e.verts[1].co
-            nm_lines.append((v1.x, v1.y, v1.z))
-            nm_lines.append((v2.x, v2.y, v2.z))
-            meshify_suggestions.add("Non-manifold → Merge by distance / Fill hole")
-
-    # ---------------------------
-    # NGON FACES
-    # ---------------------------
-    ngon_tris = []
-    for f in bm.faces:
-        if len(f.verts) > 4:
-            verts = [world @ v.co for v in f.verts]
-            for i in range(1, len(verts) - 1):
-                ngon_tris.append(verts[0])
-                ngon_tris.append(verts[i])
-                ngon_tris.append(verts[i + 1])
-            meshify_suggestions.add("Ngon → Triangulate or subdivide")
-
-    # ---------------------------
-    # VALENCE VERTICES
-    # ---------------------------
-    valence_lines = []
-    for v in bm.verts:
-        valence = len(v.link_edges)  # connectivity info :contentReference[oaicite:0]{index=0}
-
-        if valence != 4:
-            co = world @ v.co
-            scale = max(obj.dimensions) * 0.02 if max(obj.dimensions) > 0 else 0.05
-
-            valence_lines.extend([
-                (co.x - scale, co.y, co.z),
-                (co.x + scale, co.y, co.z),
-                (co.x, co.y - scale, co.z),
-                (co.x, co.y + scale, co.z),
-            ])
-            meshify_suggestions.add("Bad valence → Adjust edge flow")
-
-    # ---------------------------
-    # FACE DISTORTION
-    # ---------------------------
-    distortion_tris = []
-    for f in bm.faces:
-        lengths = [e.calc_length() for e in f.edges]
-        if not lengths:
-            continue
-
-        max_len = max(lengths)
-        min_len = min(lengths)
-        if min_len == 0:
-            continue
-
-        ratio = max_len / min_len
-        if ratio > DISTORTION_RATIO_THRESHOLD:
-            verts = [world @ v.co for v in f.verts]
-            for i in range(1, len(verts) - 1):
-                distortion_tris.append(verts[0])
-                distortion_tris.append(verts[i])
-                distortion_tris.append(verts[i + 1])
-            meshify_suggestions.add("Distortion → Even edge spacing")
+    # --- Suggestions ---
+    meshify_suggestions = build_suggestions(
+        nm_edges, ngon_faces, valence_verts, distortion_faces
+    )
 
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
 
-    # ---------------------------
-    # DRAW ALL LAYERS
-    # ---------------------------
+    # --- DRAW: DISTORTION (BLUE) ---
+    tris = []
+    for f in distortion_faces:
+        verts = [world @ v.co for v in f.verts]
+        for i in range(1, len(verts) - 1):
+            tris.extend([verts[0], verts[i], verts[i + 1]])
 
-    # Distortion (blue tint)
-    if distortion_tris:
-        batch = batch_for_shader(shader, 'TRIS', {"pos": distortion_tris})
+    if tris:
+        batch = batch_for_shader(shader, 'TRIS', {"pos": tris})
         shader.bind()
         shader.uniform_float("color", (0.2, 0.6, 1.0, 0.3))
         batch.draw(shader)
 
-    # Ngon (orange)
-    if ngon_tris:
-        batch = batch_for_shader(shader, 'TRIS', {"pos": ngon_tris})
+    # --- DRAW: NGON (ORANGE) ---
+    tris = []
+    for f in ngon_faces:
+        verts = [world @ v.co for v in f.verts]
+        for i in range(1, len(verts) - 1):
+            tris.extend([verts[0], verts[i], verts[i + 1]])
+
+    if tris:
+        batch = batch_for_shader(shader, 'TRIS', {"pos": tris})
         shader.bind()
         shader.uniform_float("color", (1.0, 0.5, 0.1, 0.35))
         batch.draw(shader)
 
-    # Non-manifold (red)
-    if nm_lines:
-        batch = batch_for_shader(shader, 'LINES', {"pos": nm_lines})
+    # --- DRAW: NON-MANIFOLD (RED EDGES) ---
+    lines = []
+    for e in nm_edges:
+        v1 = world @ e.verts[0].co
+        v2 = world @ e.verts[1].co
+        lines.extend([(v1.x, v1.y, v1.z), (v2.x, v2.y, v2.z)])
+
+    if lines:
+        batch = batch_for_shader(shader, 'LINES', {"pos": lines})
         shader.bind()
         shader.uniform_float("color", (1.0, 0.0, 0.0, 1.0))
         gpu.state.line_width_set(4.0)
         batch.draw(shader)
 
-    # Valence (yellow)
-    if valence_lines:
-        batch = batch_for_shader(shader, 'LINES', {"pos": valence_lines})
+    # --- DRAW: VALENCE (YELLOW MARKERS) ---
+    lines = []
+    for v in valence_verts:
+        co = world @ v.co
+        scale = max(obj.dimensions) * 0.02 if max(obj.dimensions) > 0 else 0.05
+
+        lines.extend([
+            (co.x - scale, co.y, co.z),
+            (co.x + scale, co.y, co.z),
+            (co.x, co.y - scale, co.z),
+            (co.x, co.y + scale, co.z),
+        ])
+
+    if lines:
+        batch = batch_for_shader(shader, 'LINES', {"pos": lines})
         shader.bind()
         shader.uniform_float("color", (1.0, 1.0, 0.2, 1.0))
         gpu.state.line_width_set(2.0)
@@ -149,9 +177,9 @@ def draw_meshify():
     gpu.state.line_width_set(1.0)
 
 
-# ---------------------------
+# =========================================================
 # HANDLER CONTROL
-# ---------------------------
+# =========================================================
 def add_draw_handler():
     global _draw_handle
     if _draw_handle is not None:
@@ -175,9 +203,6 @@ def remove_draw_handler():
     _draw_handle = None
 
 
-# ---------------------------
-# TOGGLE
-# ---------------------------
 def update_meshify_enabled(self, context):
     if self.meshify_enabled:
         add_draw_handler()
@@ -190,9 +215,9 @@ def update_meshify_enabled(self, context):
                 area.tag_redraw()
 
 
-# ---------------------------
-# UI PANEL
-# ---------------------------
+# =========================================================
+# 5. UI LAYER
+# =========================================================
 class MESHIFY_PT_main(bpy.types.Panel):
     bl_label = "Meshify"
     bl_idname = "MESHIFY_PT_main"
@@ -215,25 +240,12 @@ class MESHIFY_PT_main(bpy.types.Panel):
                 layout.label(text=f"- {s}")
 
 
-# ---------------------------
+# =========================================================
 # REGISTRATION
-# ---------------------------
+# =========================================================
 classes = (
     MESHIFY_PT_main,
 )
-
-
-def register_props():
-    bpy.types.Scene.meshify_enabled = bpy.props.BoolProperty(
-        name="Enable Meshify",
-        default=False,
-        update=update_meshify_enabled,
-    )
-
-
-def unregister_props():
-    if hasattr(bpy.types.Scene, "meshify_enabled"):
-        del bpy.types.Scene.meshify_enabled
 
 
 def register():
